@@ -6,6 +6,33 @@
 
 ### Changed
 
+## 0.3.20 Beta Release 19
+
+### Added
+
+* Initial support for Hailo AI devices, including some examples.
+* IMX708 helper class so that the sensor HDR mode can be set with Python.
+
+### Changed
+
+* Improved handling of timeouts when cameras stop responding, including a mechanism for a complete
+  reset if requests stop being returned.
+* Platform checking more robust.
+* Add missing flush parameter to captured_request() (for use with context manager).
+
+## 0.3.19 Beta Release 18
+
+### Added
+
+* Add an example showing how to forward images to other processes using zero-copy.
+* Add a context manager method for capturing requests, e.g. `with picam2.captured_request() as r:`
+* Encoders can skip frames, e.g. run at half the rate of the camera.
+
+### Changed
+
+* Configuration alignment fixed on Pi 5.
+* Improve support for displays without alpha blending.
+
 ## 0.3.18 Beta Release 17
 
 ### Added

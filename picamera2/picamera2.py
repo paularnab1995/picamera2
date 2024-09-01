@@ -2,6 +2,7 @@
 """picamera2 main class"""
 
 import atexit
+import contextlib
 import json
 import logging
 import os
@@ -55,12 +56,23 @@ class CameraManager:
         self.running = False
         self.cameras = {}
         self._lock = threading.Lock()
+        self._cms = None
 
     def setup(self):
-        self.cms = libcamera.CameraManager.singleton()
         self.thread = threading.Thread(target=self.listen, daemon=True)
         self.running = True
         self.thread.start()
+
+    @property
+    def cms(self):
+        if self._cms is None:
+            self._cms = libcamera.CameraManager.singleton()
+        return self._cms
+
+    def reset(self):
+        with self._lock:
+            self._cms = None
+            self._cms = libcamera.CameraManager.singleton()
 
     def add(self, index, camera):
         with self._lock:
@@ -77,7 +89,7 @@ class CameraManager:
                 flag = True
         if flag:
             self.thread.join()
-            self.cms = None
+            self._cms = None
 
     def listen(self):
         sel = selectors.DefaultSelector()
@@ -90,7 +102,7 @@ class CameraManager:
                 callback()
 
         sel.unregister(self.cms.event_fd)
-        self.cms = None
+        self._cms = None
 
     def handle_request(self, flushid=None):
         """Handle requests
@@ -208,7 +220,7 @@ class Picamera2:
             info["Id"] = cam.id
             info["Num"] = num
             return info
-        cameras = [describe_camera(cam, i) for i, cam in enumerate(libcamera.CameraManager.singleton().cameras)]
+        cameras = [describe_camera(cam, i) for i, cam in enumerate(Picamera2._cm.cms.cameras)]
         # Sort alphabetically so they are deterministic, but send USB cams to the back of the class.
         return sorted(cameras, key=lambda cam: ("/usb" not in cam['Id'], cam['Id']), reverse=True)
 
@@ -933,13 +945,13 @@ class Picamera2:
     @staticmethod
     def align_stream(stream_config: dict, optimal=True) -> None:
         if optimal:
-            # Adjust the image size so that all planes are a mutliple of 32 bytes wide.
+            # Adjust the image size so that all planes are a mutliple of 32/64 bytes wide.
             # This matches the hardware behaviour and means we can be more efficient.
-            align = 32
+            align = 32 if Picamera2.platform == Platform.Platform.VC4 else 64
             if stream_config["format"] in ("YUV420", "YVU420"):
-                align = 64  # because the UV planes will have half this alignment
-            elif stream_config["format"] in ("XBGR8888", "XRGB8888"):
-                align = 16  # 4 channels per pixel gives us an automatic extra factor of 2
+                align *= 2  # because the UV planes will have half this alignment
+            elif stream_config["format"] in ("XBGR8888", "XRGB8888", "RGB161616", "BGR161616"):
+                align //= 2  # we have an automatic extra factor of 2 here
         else:
             align = 2
         size = stream_config["size"]
@@ -1164,6 +1176,20 @@ class Picamera2:
             self.start_preview(show_preview)
         self.start_()
 
+    def cancel_all_and_flush(self) -> None:
+        """
+        Clear the camera system queue of pending jobs and cancel them.
+
+        Depending on what was happening at the time, this may leave the camera system in
+        an indeterminate state. This function is really only intended for tidying up
+        after an operation has unexpectedly timed out (for example, the camera cable has
+        become dislodged) so that the camera can be closed.
+        """
+        with self.lock:
+            for job in self._job_list:
+                job.cancel()
+            self._job_list = []
+
     def stop_(self, request=None) -> None:
         """Stop the camera.
 
@@ -1302,9 +1328,18 @@ class Picamera2:
         When there are multiple items each will be processed on a separate
         trip round the event loop, meaning that a single operation could stop and restart the
         camera and the next operation would receive a request from after the restart.
+
+        The wait parameter should be one of:
+            True - wait as long as necessary for the operation to compelte
+            False - return immediately, giving the caller a "job" they can wait for
+            None - default, if a signal_function was given do not wait, otherwise wait as long as necessary
+            a number - wait for this number of seconds before raising a "timed out" error.
         """
         if wait is None:
             wait = signal_function is None
+        timeout = wait
+        if timeout is True:
+            timeout = None
         with self.lock:
             only_job = not self._job_list
             job = Job(functions, signal_function)
@@ -1316,7 +1351,7 @@ class Picamera2:
             # stop commands, for which no requests are needed).
             if only_job and (self.completed_requests or immediate):
                 self._run_process_requests()
-        return job.get_result() if wait else job
+        return job.get_result(timeout=timeout) if wait else job
 
     def set_frame_drops_(self, num_frames):
         """Only for use within the camera event loop before calling drop_frames_."""  # noqa
@@ -1475,6 +1510,15 @@ class Picamera2:
         functions = [partial(self.switch_mode_, camera_config),
                      partial(capture_request_and_stop_, self)]
         return self.dispatch_functions(functions, wait, signal_function, immediate=True)
+
+    @contextlib.contextmanager
+    def captured_request(self, wait=None, flush=None):
+        """Capture a completed request using the context manager which guarantees its release."""
+        request = self.capture_request(wait=wait, flush=flush)
+        try:
+            yield request
+        finally:
+            request.release()
 
     def capture_metadata_(self):
         if not self.completed_requests:
